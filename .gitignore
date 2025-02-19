@@ -1,0 +1,6 @@
+.env
+compose.local.yaml
+.secrets
+.venv/
+certificates/
+.quix.yaml.variables

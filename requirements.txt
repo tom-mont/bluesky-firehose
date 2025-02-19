@@ -1,0 +1,4 @@
+requests_sse
+quixstreams
+websockets
+cbor2
