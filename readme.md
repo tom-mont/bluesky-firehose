@@ -1,5 +1,9 @@
 # Processing streams with quix streams
 
+## Purpose of this repo
+
+I would like to get to grips with Apache Flink. In order to do this I first need to have some data streaming through. I have worked with the [github firehose]() before but stumbled upon the [Bluesky firehose](https://docs.bsky.app/docs/advanced-guides/firehose) and thought it would be interesting to check out! I will again be using Quix streams with a bit of Claude-enabled wrangling to be able to ingest from the Websocket.
+
 ## Getting set up
 
 ```sudo quix pipeline up```
@@ -10,7 +14,7 @@ This gets kafka up and running. Fortunately, [quix](https://quix.io/get-started-
 
 We now begin producing events.
 
-```kafkacat -b localhost:19092 -Ct github_events | jq .```
+```kafkacat -b localhost:19092 -Ct bluesky-firehose | jq .```
 
 Use kafka to "consume topic" (`-Ct`) from the broker ('-b') on port `19092`.
 
