@@ -4,9 +4,11 @@ import json
 import logging
 from quixstreams import Application
 from pprint import pformat
-from typing import Optional
 import cbor2
 from datetime import datetime
+import io
+import base64
+import struct
 
 
 class CBORTagEncoder(json.JSONEncoder):
@@ -25,6 +27,65 @@ class CBORTagEncoder(json.JSONEncoder):
         return b.hex()
 
 
+class SimpleCARParser:
+    """Simplified parser for Content Addressable aRchive (CAR) format"""
+
+    def __init__(self):
+        self.blocks = {}
+
+    def parse(self, data):
+        """Parse a CAR file from bytes"""
+        stream = io.BytesIO(data)
+
+        # Skip header - read the header length first (8 bytes)
+        header_len_bytes = stream.read(8)
+        if not header_len_bytes or len(header_len_bytes) < 8:
+            return self.blocks
+
+        header_len = int.from_bytes(header_len_bytes, byteorder="big")
+        # Skip the header content
+        stream.read(header_len)
+
+        # Parse blocks
+        while True:
+            try:
+                # Read block length
+                block_length_data = stream.read(8)
+                if not block_length_data or len(block_length_data) < 8:
+                    break
+
+                block_length = int.from_bytes(block_length_data, byteorder="big")
+
+                # Read CID length and CID
+                # First read one byte for CID length
+                cid_length_data = stream.read(1)
+                if not cid_length_data:
+                    break
+
+                cid_length = cid_length_data[0]
+                cid_data = stream.read(cid_length)
+                if len(cid_data) < cid_length:
+                    break
+
+                # Read block data
+                block_data = stream.read(block_length - cid_length - 1)
+                if len(block_data) < (block_length - cid_length - 1):
+                    break
+
+                # Store block with CID as key
+                # Using hex representation of CID as key
+                cid_hex = cid_data.hex()
+                self.blocks[cid_hex] = block_data
+
+                logging.debug(f"Parsed block with CID: {cid_hex[:10]}...")
+
+            except Exception as e:
+                logging.error(f"Error parsing CAR block: {e}")
+                break
+
+        return self.blocks
+
+
 class WebSocketClient:
     def __init__(self, uri: str, producer, topic: str):
         self.uri = uri
@@ -32,6 +93,7 @@ class WebSocketClient:
         self.topic = topic
         self.websocket = None
         self.running = False
+        self.car_parser = SimpleCARParser()
 
     async def connect(self):
         while self.running:
@@ -43,6 +105,24 @@ class WebSocketClient:
             except Exception as e:
                 logging.error(f"WebSocket error: {e}")
                 await asyncio.sleep(5)
+
+    def parse_car_blocks(self, data):
+        """Parse CAR blocks from binary data"""
+        try:
+            blocks = self.car_parser.parse(data)
+            return blocks
+        except Exception as e:
+            logging.error(f"Failed to parse CAR blocks: {e}")
+            return {}
+
+    def decode_record_cbor(self, data):
+        """Decode a record from CBOR data"""
+        try:
+            record = cbor2.loads(data)
+            return record
+        except Exception as e:
+            logging.error(f"Failed to decode record CBOR: {e}")
+            return None
 
     def find_second_cbor(self, data):
         """Find the start of the second CBOR message in the binary data"""
@@ -74,13 +154,71 @@ class WebSocketClient:
             cleaned_op = {
                 "action": op.get("action"),
                 "path": op.get("path"),
-                "cid": op.get(
-                    "cid"
-                ),  # Will be encoded as tag:42:hexstring by CBORTagEncoder
+                "cid": op.get("cid"),
             }
             cleaned["ops"].append(cleaned_op)
 
         return cleaned
+
+    def extract_record_data(self, message, commit_data):
+        """Extract and parse the actual record data from the message"""
+        try:
+            # Get ops with create or update actions
+            ops_with_records = [
+                op
+                for op in commit_data.get("ops", [])
+                if op.get("action") in ["create", "update"]
+            ]
+
+            if not ops_with_records:
+                return {}
+
+            # Get the car blocks from the message
+            # The CAR data is expected to be after the two CBOR messages (header and commit)
+            header_len = len(cbor2.dumps(cbor2.loads(message)))
+            remaining = self.find_second_cbor(message)
+            if not remaining:
+                return {}
+
+            commit_len = len(cbor2.dumps(cbor2.loads(remaining)))
+            car_data_start = header_len + commit_len
+            car_data = message[car_data_start:]
+
+            if not car_data:
+                return {}
+
+            # Parse the CAR blocks
+            blocks = self.parse_car_blocks(car_data)
+
+            records = {}
+            for op in ops_with_records:
+                path = op.get("path")
+                cid = op.get("cid")
+
+                if not cid:
+                    continue
+
+                # Convert CBOR tag to hex for lookup
+                if isinstance(cid, cbor2.CBORTag) and cid.tag == 42:
+                    cid_hex = cid.value.hex()
+
+                    if cid_hex in blocks:
+                        block_data = blocks[cid_hex]
+                        try:
+                            # Decode the block data as CBOR
+                            record = self.decode_record_cbor(block_data)
+                            if record:
+                                records[path] = record
+                                logging.info(f"Extracted record for {path}: {record}")
+                        except Exception as e:
+                            logging.error(f"Failed to decode record for {path}: {e}")
+
+            return records
+
+        except Exception as e:
+            logging.error(f"Failed to extract record data: {e}")
+            logging.exception("Exception details:")
+            return {}
 
     def decode_message(self, message):
         """Decode both parts of the message"""
@@ -98,11 +236,20 @@ class WebSocketClient:
                     commit_data = cbor2.loads(remaining)
                     cleaned_commit = self.clean_commit_data(commit_data)
 
+                    # Extract record data
+                    record_data = self.extract_record_data(message, commit_data)
+
                     if cleaned_commit:
-                        return {
+                        result = {
                             "header": {"type": header.get("t"), "op": header.get("op")},
                             "commit": cleaned_commit,
                         }
+
+                        # Add record data if available
+                        if record_data:
+                            result["records"] = record_data
+
+                        return result
                 except Exception as e:
                     logging.error(f"Failed to decode commit data: {e}")
 
@@ -116,6 +263,9 @@ class WebSocketClient:
         try:
             async for message in self.websocket:
                 try:
+                    # Log the raw message size for debugging
+                    logging.debug(f"Received message of size: {len(message)} bytes")
+
                     decoded_value = self.decode_message(message)
 
                     if decoded_value:
@@ -124,8 +274,23 @@ class WebSocketClient:
 
                         logging.info(f"Processing commit from repo {repo} seq {seq}")
 
+                        # Log operations
                         for op in decoded_value["commit"].get("ops", []):
-                            logging.info(f" - {op['action']} {op['path']}")
+                            action = op["action"]
+                            path = op["path"]
+                            logging.info(f" - {action} {path}")
+
+                            # If we have record data for this path, log it
+                            if (
+                                "records" in decoded_value
+                                and path in decoded_value["records"]
+                            ):
+                                record = decoded_value["records"][path]
+                                # Pretty print record data
+                                pretty_record = json.dumps(
+                                    record, indent=2, cls=CBORTagEncoder
+                                )
+                                logging.info(f"   Record content: {pretty_record}")
 
                         # Serialize with custom encoder
                         json_value = json.dumps(decoded_value, cls=CBORTagEncoder)
@@ -139,7 +304,9 @@ class WebSocketClient:
 
                 except Exception as e:
                     logging.error(f"Failed to process message: {e}")
-                    raise
+                    logging.exception("Exception details:")
+                    # Continue processing other messages
+                    continue
 
         except websockets.ConnectionClosed:
             logging.info("WebSocket connection closed")
@@ -185,8 +352,11 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Set up more detailed logging
     logging.basicConfig(
-        level="DEBUG", format="%(asctime)s - %(levelname)s - %(message)s"
+        level="INFO", format="%(asctime)s - %(levelname)s - %(message)s"
     )
+    # Set the logger for the websockets library to WARNING to reduce noise
+    logging.getLogger("websockets").setLevel(logging.WARNING)
     asyncio.run(main())
 
