@@ -8,7 +8,6 @@ import cbor2
 from datetime import datetime
 import io
 import base64
-import struct
 
 
 class CBORTagEncoder(json.JSONEncoder):
@@ -171,49 +170,95 @@ class WebSocketClient:
             ]
 
             if not ops_with_records:
+                logging.debug("No create/update operations found in commit")
                 return {}
 
-            # Get the car blocks from the message
-            # The CAR data is expected to be after the two CBOR messages (header and commit)
-            header_len = len(cbor2.dumps(cbor2.loads(message)))
-            remaining = self.find_second_cbor(message)
-            if not remaining:
+            # Let's try a different approach with direct indexing into the message
+            # Save original message for debugging
+            original_message = message
+
+            # IMPORTANT: The CAR data is directly appended after the CBOR encoded commit
+            # So we need to find where the commit CBOR ends and the CAR begins
+            try:
+                # First CBOR message is the header
+                header = cbor2.loads(message)
+                header_bytes = cbor2.dumps(header)
+
+                # Skip past the header
+                message = message[len(header_bytes) :]
+
+                # Second CBOR message is the commit
+                commit = cbor2.loads(message)
+                commit_bytes = cbor2.dumps(commit)
+
+                # The remaining data should be the CAR
+                car_data = message[len(commit_bytes) :]
+
+                logging.info(f"Found CAR data of size: {len(car_data)} bytes")
+
+                # Write out CAR data to a file for inspection (temporary debugging)
+                with open("debug_car_data.bin", "wb") as f:
+                    f.write(car_data)
+                    logging.info("Wrote CAR data to debug_car_data.bin")
+
+            except Exception as e:
+                logging.error(f"Error separating CAR data: {e}")
                 return {}
 
-            commit_len = len(cbor2.dumps(cbor2.loads(remaining)))
-            car_data_start = header_len + commit_len
-            car_data = message[car_data_start:]
-
-            if not car_data:
-                return {}
-
-            # Parse the CAR blocks
-            blocks = self.parse_car_blocks(car_data)
-
+            # Now let's try a simpler approach to CAR parsing
             records = {}
-            for op in ops_with_records:
-                path = op.get("path")
-                cid = op.get("cid")
+            try:
+                # The CAR format starts with a specific format
+                # Try to directly find the blocks
 
-                if not cid:
-                    continue
+                # Skip the CAR header (search for the first CID directly)
+                # Most implementations expect a varint-encoded size followed by data
+                # Since we're having trouble with the standard parsing,
+                # let's try a brute force approach
 
-                # Convert CBOR tag to hex for lookup
-                if isinstance(cid, cbor2.CBORTag) and cid.tag == 42:
-                    cid_hex = cid.value.hex()
+                # Look for blocks using known IPLD CID prefixes
+                for op in ops_with_records:
+                    path = op.get("path")
+                    cid = op.get("cid")
 
-                    if cid_hex in blocks:
-                        block_data = blocks[cid_hex]
+                    if not cid or not isinstance(cid, cbor2.CBORTag):
+                        continue
+
+                    # Convert CBOR tag to bytes for search
+                    cid_bytes = None
+                    if hasattr(cid.value, "hex"):
+                        cid_hex = cid.value.hex()
+                        logging.info(f"Looking for CID hex: {cid_hex} for path: {path}")
+
+                        # Try to find this CID in the CAR data - it should be there
+                        # with some prefix bytes
+
+                        # For debugging, let's try a manual approach
+                        # Output all the path and CID information
+                        pretty_op = json.dumps(op, cls=CBORTagEncoder)
+                        logging.info(f"Operation for path {path}: {pretty_op}")
+
+                        # Try directly decoding the car_data as CBOR as well, in case
+                        # it's not in CAR format but just another CBOR message
                         try:
-                            # Decode the block data as CBOR
-                            record = self.decode_record_cbor(block_data)
-                            if record:
-                                records[path] = record
-                                logging.info(f"Extracted record for {path}: {record}")
+                            direct_record = cbor2.loads(car_data)
+                            logging.info(
+                                f"Direct CBOR decode of CAR data worked: {direct_record}"
+                            )
+                            # If this worked, use it
+                            if isinstance(direct_record, dict):
+                                records[path] = direct_record
+                                logging.info(
+                                    f"Added record for {path} from direct CBOR decode"
+                                )
                         except Exception as e:
-                            logging.error(f"Failed to decode record for {path}: {e}")
+                            logging.debug(f"Direct CBOR decode failed: {e}")
 
-            return records
+                return records
+
+            except Exception as e:
+                logging.error(f"Failed to extract blocks from CAR: {e}")
+                return {}
 
         except Exception as e:
             logging.error(f"Failed to extract record data: {e}")
@@ -259,13 +304,188 @@ class WebSocketClient:
             logging.error(f"Failed to decode message: {e}")
             return None
 
+    def pretty_print_record(self, record_type, record):
+        """Format and print record contents based on its type"""
+        try:
+            if record_type == "app.bsky.feed.post":
+                creator_id = record.get("repo", "Unknown")
+
+                # Extract post text safely
+                text = "No text"
+                if "text" in record:
+                    text = record["text"]
+                elif (
+                    isinstance(record, dict)
+                    and "record" in record
+                    and isinstance(record["record"], dict)
+                ):
+                    text = record["record"].get("text", "No text")
+
+                # Format and print the post
+                logging.info(f"📝 POST from {creator_id}: {text}")
+
+                # Print additional details if present
+                if (
+                    isinstance(record, dict)
+                    and "record" in record
+                    and isinstance(record["record"], dict)
+                ):
+                    if "langs" in record["record"]:
+                        logging.info(f"  Language: {record['record']['langs']}")
+                    if "embed" in record["record"]:
+                        embed_type = record["record"]["embed"].get(
+                            "$type", "unknown embed"
+                        )
+                        logging.info(f"  Has embed: {embed_type}")
+
+            elif record_type == "app.bsky.feed.like":
+                creator_id = record.get("repo", "Unknown")
+                subject = None
+
+                if (
+                    isinstance(record, dict)
+                    and "record" in record
+                    and isinstance(record["record"], dict)
+                ):
+                    if "subject" in record["record"]:
+                        subject = record["record"]["subject"]
+
+                if subject:
+                    target_uri = subject.get("uri", "unknown")
+                    logging.info(f"👍 LIKE from {creator_id} for {target_uri}")
+                else:
+                    logging.info(f"👍 LIKE from {creator_id} for unknown content")
+
+            elif record_type == "app.bsky.feed.repost":
+                creator_id = record.get("repo", "Unknown")
+                subject = None
+
+                if (
+                    isinstance(record, dict)
+                    and "record" in record
+                    and isinstance(record["record"], dict)
+                ):
+                    if "subject" in record["record"]:
+                        subject = record["record"]["subject"]
+
+                if subject:
+                    target_uri = subject.get("uri", "unknown")
+                    logging.info(f"🔄 REPOST from {creator_id} of {target_uri}")
+                else:
+                    logging.info(f"🔄 REPOST from {creator_id} of unknown content")
+
+            elif record_type == "app.bsky.graph.follow":
+                creator_id = record.get("repo", "Unknown")
+                subject = None
+
+                if (
+                    isinstance(record, dict)
+                    and "record" in record
+                    and isinstance(record["record"], dict)
+                ):
+                    if "subject" in record["record"]:
+                        subject = record["record"]["subject"]
+
+                if subject:
+                    target_did = subject.get("did", "unknown")
+                    logging.info(f"👤 FOLLOW from {creator_id} to {target_did}")
+                else:
+                    logging.info(f"👤 FOLLOW from {creator_id} to unknown user")
+
+            else:
+                # For other types, print a summary
+                logging.info(
+                    f"📄 {record_type.upper()} record from {record.get('repo', 'Unknown')}"
+                )
+
+        except Exception as e:
+            logging.error(f"Error pretty printing record: {e}")
+            # Fall back to basic JSON
+            pretty_record = json.dumps(record, indent=2, cls=CBORTagEncoder)
+            logging.info(f"Record content: {pretty_record[:200]}...")
+
     async def _handle_messages(self):
         try:
             async for message in self.websocket:
                 try:
                     # Log the raw message size for debugging
-                    logging.debug(f"Received message of size: {len(message)} bytes")
+                    logging.info(f"Received message of size: {len(message)} bytes")
 
+                    # Let's log the first few bytes to understand the structure
+                    logging.info(f"Message starts with: {message[:50].hex()}")
+
+                    # Try to decode the first CBOR message
+                    try:
+                        first_cbor = cbor2.loads(message)
+                        logging.info(f"First CBOR object: {first_cbor}")
+
+                        # Move past the first CBOR object
+                        first_bytes = cbor2.dumps(first_cbor)
+                        remaining = message[len(first_bytes) :]
+
+                        # Try to decode the second CBOR message
+                        try:
+                            second_cbor = cbor2.loads(remaining)
+                            logging.info(f"Second CBOR object: {second_cbor}")
+
+                            # Look specifically for post content in this message
+                            if isinstance(second_cbor, dict) and "ops" in second_cbor:
+                                for op in second_cbor["ops"]:
+                                    if op.get(
+                                        "action"
+                                    ) == "create" and "app.bsky.feed.post" in op.get(
+                                        "path", ""
+                                    ):
+                                        logging.info(f"Found a post creation op: {op}")
+
+                                        # Extract the CID
+                                        cid = op.get("cid")
+                                        if cid:
+                                            logging.info(f"Post CID: {cid}")
+
+                                            # Skip past the second CBOR object
+                                            second_bytes = cbor2.dumps(second_cbor)
+                                            remaining2 = remaining[len(second_bytes) :]
+
+                                            # The rest should be the CAR data
+                                            logging.info(
+                                                f"CAR data size: {len(remaining2)} bytes"
+                                            )
+
+                                            # Try direct approach - dump the data to a file for inspection
+                                            with open("post_car_data.bin", "wb") as f:
+                                                f.write(remaining2)
+                                                logging.info(
+                                                    f"Wrote CAR data to post_car_data.bin"
+                                                )
+
+                                            # Try if it's actually a CBOR object directly
+                                            try:
+                                                third_cbor = cbor2.loads(remaining2)
+                                                logging.info(
+                                                    f"Direct decode of 'CAR' worked: {third_cbor}"
+                                                )
+
+                                                # Check if this has the post text
+                                                if (
+                                                    isinstance(third_cbor, dict)
+                                                    and "text" in third_cbor
+                                                ):
+                                                    logging.info(
+                                                        f"POST TEXT FOUND: {third_cbor['text']}"
+                                                    )
+                                            except Exception as e:
+                                                logging.debug(
+                                                    f"Direct CBOR decode of CAR failed: {e}"
+                                                )
+
+                        except Exception as e:
+                            logging.debug(f"Second CBOR decode failed: {e}")
+
+                    except Exception as e:
+                        logging.debug(f"First CBOR decode failed: {e}")
+
+                    # Regular processing
                     decoded_value = self.decode_message(message)
 
                     if decoded_value:
@@ -274,23 +494,11 @@ class WebSocketClient:
 
                         logging.info(f"Processing commit from repo {repo} seq {seq}")
 
-                        # Log operations
+                        # Process operations
                         for op in decoded_value["commit"].get("ops", []):
                             action = op["action"]
                             path = op["path"]
                             logging.info(f" - {action} {path}")
-
-                            # If we have record data for this path, log it
-                            if (
-                                "records" in decoded_value
-                                and path in decoded_value["records"]
-                            ):
-                                record = decoded_value["records"][path]
-                                # Pretty print record data
-                                pretty_record = json.dumps(
-                                    record, indent=2, cls=CBORTagEncoder
-                                )
-                                logging.info(f"   Record content: {pretty_record}")
 
                         # Serialize with custom encoder
                         json_value = json.dumps(decoded_value, cls=CBORTagEncoder)
@@ -359,4 +567,3 @@ if __name__ == "__main__":
     # Set the logger for the websockets library to WARNING to reduce noise
     logging.getLogger("websockets").setLevel(logging.WARNING)
     asyncio.run(main())
-
